@@ -954,30 +954,6 @@ struct lock_sys_t{
 						is running */
 };
 
-/*********************************************************************//**
-Creates a new record lock and inserts it to the lock queue. Does NOT check
-for deadlocks or lock compatibility!
-@return created lock */
-UNIV_INLINE
-lock_t*
-lock_rec_create(
-/*============*/
-#ifdef WITH_WSREP
-	lock_t*			c_lock,	/*!< conflicting lock */
-	que_thr_t*		thr,	/*!< thread owning trx */
-#endif
-	ulint			type_mode,/*!< in: lock mode and wait
-					flag, type is ignored and
-					replaced by LOCK_REC */
-	const buf_block_t*	block,	/*!< in: buffer block containing
-					the record */
-	ulint			heap_no,/*!< in: heap number of the record */
-	dict_index_t*		index,	/*!< in: index of record */
-	trx_t*			trx,	/*!< in,out: transaction */
-	bool			caller_owns_trx_mutex);
-					/*!< in: true if caller owns
-					trx mutex */
-
 /*************************************************************//**
 Removes a record lock request, waiting or granted, from the queue. */
 void
@@ -987,32 +963,29 @@ lock_rec_discard(
 					record locks which are contained
 					in this lock object are removed */
 
-/** Create a new record lock and inserts it to the lock queue,
+/** Create and register a B-tree record lock,
 without checking for deadlocks or conflicts.
 @param[in]	type_mode	lock mode and wait flag; type will be replaced
 				with LOCK_REC
-@param[in]	space		tablespace id
-@param[in]	page_no		index page number
-@param[in]	page		R-tree index page, or NULL
+@param[in]	block		B-tree index leaf page
 @param[in]	heap_no		record heap number in the index page
-@param[in]	index		the index tree
+@param[in]	index		B-tree index
 @param[in,out]	trx		transaction
 @param[in]	holds_trx_mutex	whether the caller holds trx->mutex
 @return created lock */
 lock_t*
-lock_rec_create_low(
+lock_rec_create(
 #ifdef WITH_WSREP
-	lock_t*		c_lock,	/*!< conflicting lock */
-	que_thr_t*	thr,	/*!< thread owning trx */
+	lock_t*			c_lock,	/*!< conflicting lock */
+	que_thr_t*		thr,	/*!< thread owning trx */
 #endif
-	ulint		type_mode,
-	ulint		space,
-	ulint		page_no,
-	const page_t*	page,
-	ulint		heap_no,
-	dict_index_t*	index,
-	trx_t*		trx,
-	bool		holds_trx_mutex);
+	ulint			type_mode,
+	const buf_block_t*	block,
+	ulint			heap_no,
+	dict_index_t*		index,
+	trx_t*			trx,
+	bool			holds_trx_mutex);
+
 /** Enqueue a waiting request for a lock which cannot be granted immediately.
 Check for deadlocks.
 @param[in]	type_mode	the requested lock mode (LOCK_S or LOCK_X)

@@ -913,6 +913,51 @@ lock_prdt_lock(
 	return(err);
 }
 
+/** Create and register an R-tree page lock,
+without checking for deadlocks or conflicts.
+@param[in]	space		tablespace id
+@param[in]	page_no		R-tree index page number
+@param[in]	index		R-tree index
+@param[in,out]	trx		transaction
+@return created lock */
+static
+lock_t*
+lock_page_create(ulint space, ulint page_no, dict_index_t* index, trx_t* trx)
+{
+	ut_ad(lock_mutex_own());
+	ut_ad(!trx_mutex_own(trx));
+	ut_ad(dict_index_is_spatial(index));
+
+	lock_t* lock = trx->lock.rec_cached >= trx->lock.rec_pool.size()
+		? static_cast<lock_t*>(mem_heap_alloc(trx->lock.lock_heap,
+						      1 + sizeof *lock))
+		: trx->lock.rec_pool[trx->lock.rec_cached++];
+
+	lock->trx = trx;
+	lock->type_mode = LOCK_S | LOCK_PRDT_PAGE | LOCK_REC;
+	lock->index = index;
+	lock->un_member.rec_lock.space = uint32_t(space);
+	lock->un_member.rec_lock.page_no = uint32_t(page_no);
+
+	/* Predicate lock always on INFIMUM (0) */
+	lock->un_member.rec_lock.n_bits = 8;
+	*reinterpret_cast<byte*>(&lock[1]) = 1U << PRDT_HEAPNO;
+	index->table->n_rec_locks++;
+	ut_ad(index->table->n_ref_count > 0 || !index->table->can_be_evicted);
+
+	HASH_INSERT(lock_t, hash, lock_sys->prdt_page_hash,
+		    lock_rec_fold(space, page_no), lock);
+
+	trx_mutex_enter(trx);
+	UT_LIST_ADD_LAST(trx->lock.trx_locks, lock);
+	trx_mutex_exit(trx);
+
+	MONITOR_INC(MONITOR_RECLOCK_CREATED);
+	MONITOR_INC(MONITOR_NUM_RECLOCK);
+
+	return lock;
+}
+
 /*********************************************************************//**
 Acquire a "Page" lock on a block
 @return	DB_SUCCESS, DB_LOCK_WAIT, or DB_DEADLOCK */
@@ -939,8 +984,6 @@ lock_place_prdt_page_lock(
 
 	const lock_t*	lock = lock_rec_get_first_on_page_addr(
 		lock_sys->prdt_page_hash, space, page_no);
-
-	const ulint	mode = LOCK_S | LOCK_PRDT_PAGE;
 	trx_t*		trx = thr_get_trx(thr);
 
 	if (lock != NULL) {
@@ -954,19 +997,15 @@ lock_place_prdt_page_lock(
 			lock = lock_rec_get_next_on_page_const(lock);
 		}
 
-		ut_ad(lock == NULL || lock->type_mode == (mode | LOCK_REC));
+		ut_ad(lock == NULL || lock->type_mode
+		      == (LOCK_S | LOCK_PRDT_PAGE | LOCK_REC));
 		ut_ad(lock == NULL || lock_rec_get_n_bits(lock) != 0);
 
 		trx_mutex_exit(trx);
 	}
 
 	if (lock == NULL) {
-		lock = lock_rec_create_low(
-#ifdef WITH_WSREP
-			NULL, NULL, /* FIXME: replicate SPATIAL INDEX locks */
-#endif
-			mode, space, page_no, NULL, PRDT_HEAPNO,
-			index, trx, FALSE);
+		lock = lock_page_create(space, page_no, index, trx);
 
 #ifdef PRDT_DIAG
 		printf("GIS_DIAGNOSTIC: page lock %d\n", (int) page_no);

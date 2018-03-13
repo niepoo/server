@@ -62,8 +62,10 @@ my_bool	innobase_deadlock_detect;
 /** Total number of cached record locks */
 static const ulint	REC_LOCK_CACHE = 8;
 
+/** Maximum record lock heap size in bytes */
+static const ulint	REC_LOCK_HEAP_SIZE = 256;
 /** Maximum record lock size in bytes */
-static const ulint	REC_LOCK_SIZE = sizeof(ib_lock_t) + 256;
+static const ulint	REC_LOCK_SIZE = sizeof(ib_lock_t) + REC_LOCK_HEAP_SIZE;
 
 /** Total number of cached table locks */
 static const ulint	TABLE_LOCK_CACHE = 8;
@@ -1513,32 +1515,28 @@ wsrep_print_wait_locks(
 }
 #endif /* WITH_WSREP */
 
-/** Create a new record lock and inserts it to the lock queue,
+/** Create and register a B-tree record lock,
 without checking for deadlocks or conflicts.
 @param[in]	type_mode	lock mode and wait flag; type will be replaced
 				with LOCK_REC
-@param[in]	space		tablespace id
-@param[in]	page_no		index page number
-@param[in]	page		R-tree index page, or NULL
+@param[in]	block		B-tree index leaf page
 @param[in]	heap_no		record heap number in the index page
-@param[in]	index		the index tree
+@param[in]	index		B-tree index
 @param[in,out]	trx		transaction
 @param[in]	holds_trx_mutex	whether the caller holds trx->mutex
 @return created lock */
 lock_t*
-lock_rec_create_low(
+lock_rec_create(
 #ifdef WITH_WSREP
-	lock_t*		c_lock,	/*!< conflicting lock */
-	que_thr_t*	thr,	/*!< thread owning trx */
+	lock_t*			c_lock,	/*!< conflicting lock */
+	que_thr_t*		thr,	/*!< thread owning trx */
 #endif
-	ulint		type_mode,
-	ulint		space,
-	ulint		page_no,
-	const page_t*	page,
-	ulint		heap_no,
-	dict_index_t*	index,
-	trx_t*		trx,
-	bool		holds_trx_mutex)
+	ulint			type_mode,
+	const buf_block_t*	block,
+	ulint			heap_no,
+	dict_index_t*		index,
+	trx_t*			trx,
+	bool			holds_trx_mutex)
 {
 	lock_t*		lock;
 	ulint		n_bits;
@@ -1547,6 +1545,8 @@ lock_rec_create_low(
 	ut_ad(lock_mutex_own());
 	ut_ad(holds_trx_mutex == trx_mutex_own(trx));
 	ut_ad(dict_index_is_clust(index) || !dict_index_is_online_ddl(index));
+	ut_ad(!(type_mode & (LOCK_PREDICATE | LOCK_PRDT_PAGE)));
+	ut_ad(!dict_index_is_spatial(index));
 
 #ifdef UNIV_DEBUG
 	/* Non-locking autocommit read-only transactions should not set
@@ -1566,32 +1566,12 @@ lock_rec_create_low(
 		type_mode = type_mode & ~(LOCK_GAP | LOCK_REC_NOT_GAP);
 	}
 
-	if (UNIV_LIKELY(!(type_mode & (LOCK_PREDICATE | LOCK_PRDT_PAGE)))) {
-		/* Make lock bitmap bigger by a safety margin */
-		n_bits = page_dir_get_n_heap(page) + LOCK_PAGE_BITMAP_MARGIN;
-		n_bytes = 1 + n_bits / 8;
-	} else {
-		ut_ad(heap_no == PRDT_HEAPNO);
-
-		/* The lock is always on PAGE_HEAP_NO_INFIMUM (0), so
-		we only need 1 bit (which round up to 1 byte) for
-		lock bit setting */
-		n_bytes = 1;
-
-		if (type_mode & LOCK_PREDICATE) {
-			ulint	tmp = UNIV_WORD_SIZE - 1;
-
-			/* We will attach predicate structure after lock.
-			Make sure the memory is aligned on 8 bytes,
-			the mem_heap_alloc will align it with
-			MEM_SPACE_NEEDED anyway. */
-			n_bytes = (n_bytes + sizeof(lock_prdt_t) + tmp) & ~tmp;
-			ut_ad(n_bytes == sizeof(lock_prdt_t) + UNIV_WORD_SIZE);
-		}
-	}
+	/* Make lock bitmap bigger by a safety margin */
+	n_bits = page_dir_get_n_heap(block->frame) + LOCK_PAGE_BITMAP_MARGIN;
+	n_bytes = 1 + n_bits / 8;
 
  	if (trx->lock.rec_cached >= trx->lock.rec_pool.size()
-	    || sizeof *lock + n_bytes > REC_LOCK_SIZE) {
+	    || n_bytes > REC_LOCK_HEAP_SIZE) {
 		lock = static_cast<lock_t*>(
 			mem_heap_alloc(trx->lock.lock_heap,
 				       sizeof *lock + n_bytes));
@@ -1602,15 +1582,10 @@ lock_rec_create_low(
 	lock->trx = trx;
 	lock->type_mode = (type_mode & ~LOCK_TYPE_MASK) | LOCK_REC;
 	lock->index = index;
-	lock->un_member.rec_lock.space = uint32_t(space);
-	lock->un_member.rec_lock.page_no = uint32_t(page_no);
+	lock->un_member.rec_lock.space = block->page.id.space();
+	lock->un_member.rec_lock.page_no = block->page.id.page_no();
 
-	if (UNIV_LIKELY(!(type_mode & (LOCK_PREDICATE | LOCK_PRDT_PAGE)))) {
-		lock->un_member.rec_lock.n_bits = uint32_t(n_bytes * 8);
-	} else {
-		/* Predicate lock always on INFIMUM (0) */
-		lock->un_member.rec_lock.n_bits = 8;
- 	}
+	lock->un_member.rec_lock.n_bits = uint32_t(n_bytes * 8);
 	lock_rec_bitmap_reset(lock);
 	lock_rec_set_nth_bit(lock, heap_no);
 	index->table->n_rec_locks++;
@@ -1690,15 +1665,15 @@ lock_rec_create_low(
 		trx_mutex_exit(c_lock->trx);
 	} else
 #endif /* WITH_WSREP */
-	if (!(type_mode & (LOCK_WAIT | LOCK_PREDICATE | LOCK_PRDT_PAGE))
+	if (!(type_mode & LOCK_WAIT)
 	    && innodb_lock_schedule_algorithm
 	    == INNODB_LOCK_SCHEDULE_ALGORITHM_VATS
 	    && !thd_is_replication_slave_thread(trx->mysql_thd)) {
 		HASH_PREPEND(lock_t, hash, lock_sys->rec_hash,
-			     lock_rec_fold(space, page_no), lock);
+			     lock_rec_lock_fold(lock), lock);
 	} else {
-		HASH_INSERT(lock_t, hash, lock_hash_get(type_mode),
-			    lock_rec_fold(space, page_no), lock);
+		HASH_INSERT(lock_t, hash, lock_sys->rec_hash,
+			    lock_rec_lock_fold(lock), lock);
 	}
 
 	if (!holds_trx_mutex) {
